@@ -1226,6 +1226,7 @@ static int libplacebo_activate(AVFilterContext *ctx)
                 .pts            = TS2T(out_pts, outlink->time_base),
                 .radius         = pl_frame_mix_radius(&s->opts->params),
                 .vsync_duration = l->frame_rate.num ? av_q2d(av_inv_q(l->frame_rate)) : 0,
+                .drift_compensation = 0, // Disable drift comp for high-fps content
             ));
 
             switch (in->qstatus) {

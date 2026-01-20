@@ -8766,6 +8766,7 @@ static const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_HEVC,            MKTAG('h', 'e', 'v', '1') },
     { AV_CODEC_ID_HEVC,            MKTAG('h', 'v', 'c', '1') },
     { AV_CODEC_ID_HEVC,            MKTAG('d', 'v', 'h', '1') },
+    { AV_CODEC_ID_HEVC,            MKTAG('d', 'v', 'h', 'e') }, /* Dolby Vision HEVC with in-band params */
     { AV_CODEC_ID_VVC,             MKTAG('v', 'v', 'c', '1') },
     { AV_CODEC_ID_VVC,             MKTAG('v', 'v', 'i', '1') },
     { AV_CODEC_ID_EVC,             MKTAG('e', 'v', 'c', '1') },
