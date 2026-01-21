@@ -857,6 +857,7 @@ extern const FFCodec ff_av1_vaapi_encoder;
 extern const FFCodec ff_av1_vulkan_encoder;
 extern const FFCodec ff_libopenh264_encoder;
 extern const FFCodec ff_libopenh264_decoder;
+extern const FFCodec ff_libedge264_decoder;
 extern const FFCodec ff_h264_amf_encoder;
 extern const FFCodec ff_h264_amf_decoder;
 extern const FFCodec ff_h264_cuvid_decoder;

@@ -2536,6 +2536,22 @@ static int mkv_parse_block_addition_mappings(AVFormatContext *s, AVStream *st, M
                 return ret;
 
             break;
+        case MATROSKA_BLOCK_ADD_ID_TYPE_MVCC:
+            // MVC: append mvcC extradata to codec extradata for h264_mp4toannexb
+            if (mapping->extradata.size > 0 && st->codecpar->extradata_size > 0) {
+                int new_size = st->codecpar->extradata_size + mapping->extradata.size;
+                uint8_t *new_extradata = av_realloc(st->codecpar->extradata, new_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                if (!new_extradata)
+                    return AVERROR(ENOMEM);
+                memcpy(new_extradata + st->codecpar->extradata_size,
+                       mapping->extradata.data, mapping->extradata.size);
+                memset(new_extradata + new_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+                st->codecpar->extradata = new_extradata;
+                st->codecpar->extradata_size = new_size;
+                av_log(s, AV_LOG_DEBUG, "MVC: appended mvcC extradata (%d bytes)\n",
+                       (int)mapping->extradata.size);
+            }
+            break;
         default:
             av_log(s, AV_LOG_DEBUG,
                    "Unknown Block Addition Mapping type 0x%"PRIx64", value %"PRIu64", name \"%s\"\n",
@@ -3899,7 +3915,8 @@ static int matroska_parse_block_additional(MatroskaDemuxContext *matroska,
     }
 
     for (int i = 0; i < mappings_list->nb_elem; i++) {
-        if (id != mappings[i].value)
+        // Match if id equals value, or if value is 0 (wildcard per Matroska spec)
+        if (id != mappings[i].value && mappings[i].value != 0)
             continue;
         mapping = &mappings[i];
         break;
