@@ -27,6 +27,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
+#include "libavutil/stereo3d.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -41,6 +42,7 @@ typedef struct Edge264Context
     AVClass *av_class;
     Edge264Decoder *decoder;
     int mvc_output; // 0 = base view only, 1 = SBS output
+    int swap_eyes;  // swap left/right eye order for SBS output
 
     // Frame queue for buffered output
     AVFrame *frame_queue[FRAME_QUEUE_SIZE];
@@ -184,6 +186,30 @@ static av_cold int edge264_decode_init(AVCodecContext *avctx)
 
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->pts_count = 0;
+    ctx->swap_eyes = 0;
+
+    // Check for stereo3d side data to determine eye order
+    // block_rl (most 3D Blu-rays): base=right eye, no swap needed
+    // block_lr: base=left eye, need to swap
+    for (int i = 0; i < avctx->nb_coded_side_data; i++)
+    {
+        if (avctx->coded_side_data[i].type == AV_PKT_DATA_STEREO3D)
+        {
+            const AVStereo3D *stereo = (const AVStereo3D *)avctx->coded_side_data[i].data;
+            // If NOT inverted, it's block_lr (left-right), so we need to swap
+            // If inverted, it's block_rl (right-left), no swap needed
+            if (!(stereo->flags & AV_STEREO3D_FLAG_INVERT))
+            {
+                ctx->swap_eyes = 1;
+                av_log(avctx, AV_LOG_DEBUG, "Detected block_lr stereo mode, swapping eyes\n");
+            }
+            else
+            {
+                av_log(avctx, AV_LOG_DEBUG, "Detected block_rl stereo mode, no swap needed\n");
+            }
+            break;
+        }
+    }
 
     if (avctx->extradata && avctx->extradata_size > 7)
     {
@@ -230,26 +256,36 @@ static int output_frame(AVCodecContext *avctx, AVFrame *avframe,
         int w = frame->width_Y;
         int h = frame->height_Y;
 
+        // Determine which view goes on which side
+        // For block_rl (most Blu-rays): mvc=left eye, base=right eye, no swap
+        // For block_lr: mvc=right eye, base=left eye, need swap
+        const uint8_t *left_Y = ctx->swap_eyes ? frame->samples[0] : frame->samples_mvc[0];
+        const uint8_t *right_Y = ctx->swap_eyes ? frame->samples_mvc[0] : frame->samples[0];
+        const uint8_t *left_U = ctx->swap_eyes ? frame->samples[1] : frame->samples_mvc[1];
+        const uint8_t *right_U = ctx->swap_eyes ? frame->samples_mvc[1] : frame->samples[1];
+        const uint8_t *left_V = ctx->swap_eyes ? frame->samples[2] : frame->samples_mvc[2];
+        const uint8_t *right_V = ctx->swap_eyes ? frame->samples_mvc[2] : frame->samples[2];
+
         for (int y = 0; y < h; y++)
         {
             memcpy(avframe->data[0] + y * avframe->linesize[0],
-                   frame->samples_mvc[0] + y * frame->stride_Y, w);
+                   left_Y + y * frame->stride_Y, w);
             memcpy(avframe->data[0] + y * avframe->linesize[0] + w,
-                   frame->samples[0] + y * frame->stride_Y, w);
+                   right_Y + y * frame->stride_Y, w);
         }
         for (int y = 0; y < h / 2; y++)
         {
             memcpy(avframe->data[1] + y * avframe->linesize[1],
-                   frame->samples_mvc[1] + y * frame->stride_C, w / 2);
+                   left_U + y * frame->stride_C, w / 2);
             memcpy(avframe->data[1] + y * avframe->linesize[1] + w / 2,
-                   frame->samples[1] + y * frame->stride_C, w / 2);
+                   right_U + y * frame->stride_C, w / 2);
         }
         for (int y = 0; y < h / 2; y++)
         {
             memcpy(avframe->data[2] + y * avframe->linesize[2],
-                   frame->samples_mvc[2] + y * frame->stride_C, w / 2);
+                   left_V + y * frame->stride_C, w / 2);
             memcpy(avframe->data[2] + y * avframe->linesize[2] + w / 2,
-                   frame->samples[2] + y * frame->stride_C, w / 2);
+                   right_V + y * frame->stride_C, w / 2);
         }
     }
     else
