@@ -68,6 +68,17 @@ typedef enum {
     CODEC_ATTRIBUTE_WILL_NOT_BE_WRITTEN,
 } CodecAttributeStatus;
 
+/**
+ * Callback context for segment completion notifications.
+ * Set via AVFormatContext.opaque before writing header.
+ */
+typedef struct HLSSegmentCallbackContext {
+    void *user_data;
+    void (*on_segment_complete)(void *user_data, const char *filename,
+                                int64_t size, double duration,
+                                int64_t sequence, unsigned var_stream_idx);
+} HLSSegmentCallbackContext;
+
 #define KEYSIZE 16
 #define LINE_BUFFER_SIZE MAX_URL_SIZE
 #define HLS_MICROSECOND_UNIT   1000000
@@ -1233,6 +1244,16 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
         return 0;
     }
     vs->sequence++;
+
+    /* Invoke segment completion callback if set via opaque */
+    if (s->opaque) {
+        HLSSegmentCallbackContext *ctx = (HLSSegmentCallbackContext *)s->opaque;
+        if (ctx->on_segment_complete) {
+            ctx->on_segment_complete(ctx->user_data, en->filename,
+                                     en->size, en->duration,
+                                     vs->sequence - 1, vs->var_stream_idx);
+        }
+    }
 
     return 0;
 }
