@@ -42,7 +42,6 @@ typedef struct Edge264Context {
     Edge264Decoder *decoder;
     int mvc_output;  // 0 = base view only, 1 = SBS output
     int swap_eyes;   // swap left/right eye order for SBS output
-    int waiting_for_keyframe;  // discard packets until keyframe after init/flush
 
     // Frame queue for buffered output
     AVFrame *frame_queue[FRAME_QUEUE_SIZE];
@@ -53,6 +52,10 @@ typedef struct Edge264Context {
     // PTS queue - sorted in ascending order for display-order assignment
     int64_t pts_queue[PTS_QUEUE_SIZE];
     int pts_count;
+
+    // DTS queue - FIFO order for decode-order assignment
+    int64_t dts_queue[PTS_QUEUE_SIZE];
+    int dts_count;
 } Edge264Context;
 
 static av_cold int edge264_decode_close(AVCodecContext *avctx)
@@ -80,13 +83,11 @@ static av_cold void edge264_decode_flush(AVCodecContext *avctx)
         ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
     }
 
-    // Clear PTS queue
+    // Clear PTS and DTS queues
     ctx->pts_count = 0;
+    ctx->dts_count = 0;
 
-    // Wait for keyframe after flush
-    ctx->waiting_for_keyframe = 1;
-
-    // Flush decoder internal state
+    // Flush decoder internal state - edge264 handles keyframe requirements internally
     if (ctx->decoder)
         edge264_flush(ctx->decoder);
 }
@@ -142,6 +143,30 @@ static int64_t pop_smallest_pts(Edge264Context *ctx)
         ctx->pts_queue[i - 1] = ctx->pts_queue[i];
     ctx->pts_count--;
     return pts;
+}
+
+// Add DTS to FIFO queue (decode order)
+static void push_dts(Edge264Context *ctx, int64_t dts)
+{
+    if (dts == AV_NOPTS_VALUE)
+        return;
+    if (ctx->dts_count >= PTS_QUEUE_SIZE)
+        return;
+    ctx->dts_queue[ctx->dts_count++] = dts;
+}
+
+// Get and remove the oldest DTS (FIFO)
+static int64_t pop_dts(Edge264Context *ctx)
+{
+    if (ctx->dts_count == 0)
+        return AV_NOPTS_VALUE;
+
+    int64_t dts = ctx->dts_queue[0];
+    // Shift remaining elements
+    for (int i = 1; i < ctx->dts_count; i++)
+        ctx->dts_queue[i - 1] = ctx->dts_queue[i];
+    ctx->dts_count--;
+    return dts;
 }
 
 static void edge264_log_callback(const char *str, void *log_arg)
@@ -201,8 +226,8 @@ static av_cold int edge264_decode_init(AVCodecContext *avctx)
 
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->pts_count = 0;
+    ctx->dts_count = 0;
     ctx->swap_eyes = 0;
-    ctx->waiting_for_keyframe = 1;  // Wait for keyframe before decoding
 
     // Check for stereo3d side data to determine eye order
     // block_rl (most 3D Blu-rays): base=right eye, no swap needed
@@ -370,7 +395,6 @@ static int edge264_decode_frame(AVCodecContext *avctx, AVFrame *avframe,
             av_frame_move_ref(avframe, queued);
             av_frame_free(&queued);
             avframe->pts = pop_smallest_pts(ctx);
-            avframe->pkt_dts = AV_NOPTS_VALUE;
             *got_frame = 1;
             return 0;
         }
@@ -392,57 +416,21 @@ static int edge264_decode_frame(AVCodecContext *avctx, AVFrame *avframe,
             av_frame_move_ref(avframe, queued);
             av_frame_free(&queued);
             avframe->pts = pop_smallest_pts(ctx);
-            avframe->pkt_dts = AV_NOPTS_VALUE;
             *got_frame = 1;
         }
         return 0;
     }
 
-    // KEYFRAME CHECK - must be done BEFORE any decoding
-    // Wait for keyframe after init/flush to avoid reference frame issues
-    if (ctx->waiting_for_keyframe) {
-        int is_idr = (avpkt->flags & AV_PKT_FLAG_KEY);
+    // DECODE FIRST, then return frames.
+    // This reduces output lag by processing the packet immediately rather than
+    // returning old queued frames first. For A/V sync, video output should keep
+    // pace with audio - returning stale frames first causes video to lag behind.
 
-        // Also check NAL unit type directly - IDR = type 5
-        // MKV demuxer may not set KEY flag correctly for MVC
-        if (!is_idr && avpkt->size >= 5) {
-            const uint8_t *p = avpkt->data;
-            // Skip start code if present
-            if (p[0] == 0 && p[1] == 0 && p[2] == 1) {
-                p += 3;
-            } else if (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) {
-                p += 4;
-            }
-            int nal_type = p[0] & 0x1f;
-            is_idr = (nal_type == 5);  // IDR slice
-        }
-
-        if (!is_idr) {
-            // Skip non-keyframe packets until we see a keyframe
-            // Don't add PTS, don't decode, just consume the packet
-            return avpkt->size;
-        }
-        ctx->waiting_for_keyframe = 0;
-        av_log(avctx, AV_LOG_DEBUG, "edge264: Found keyframe (IDR), starting decode\n");
-    }
-
-    // Check for queued frames - return one while processing new packet
-    int32_t frame_id;
-    AVFrame *queued = dequeue_frame(ctx, &frame_id);
-
-    if (queued) {
-        // Return queued frame, assign smallest available PTS
-        av_frame_move_ref(avframe, queued);
-        av_frame_free(&queued);
-        avframe->pts = pop_smallest_pts(ctx);
-        avframe->pkt_dts = AV_NOPTS_VALUE;
-        *got_frame = 1;
-    }
-
-    // Add this packet's PTS to sorted queue
+    // Add this packet's PTS and DTS to queues
     insert_pts_sorted(ctx, avpkt->pts);
+    push_dts(ctx, avpkt->dts);
 
-    // Decode NAL units
+    // Decode NAL units FIRST
     decode_nal_units_collect_frames(ctx->decoder, avpkt->data, avpkt->size, avctx, ctx);
 
     // Check for MVC in side data
@@ -453,16 +441,14 @@ static int edge264_decode_frame(AVCodecContext *avctx, AVFrame *avframe,
         decode_nal_units_collect_frames(ctx->decoder, side_data + 8, side_size - 8, avctx, ctx);
     }
 
-    // If we didn't already return a frame, try to return one now
-    if (!*got_frame) {
-        queued = dequeue_frame(ctx, &frame_id);
-        if (queued) {
-            av_frame_move_ref(avframe, queued);
-            av_frame_free(&queued);
-            avframe->pts = pop_smallest_pts(ctx);
-            avframe->pkt_dts = AV_NOPTS_VALUE;
-            *got_frame = 1;
-        }
+    // NOW return a frame from the queue (includes frames just decoded)
+    int32_t frame_id;
+    AVFrame *queued = dequeue_frame(ctx, &frame_id);
+    if (queued) {
+        av_frame_move_ref(avframe, queued);
+        av_frame_free(&queued);
+        avframe->pts = pop_smallest_pts(ctx);
+        *got_frame = 1;
     }
 
     return avpkt->size;
@@ -495,8 +481,7 @@ const FFCodec ff_libedge264_decoder = {
     .close          = edge264_decode_close,
     .flush          = edge264_decode_flush,
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_SETS_PKT_DTS |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .bsfs           = "h264_mp4toannexb",
     .p.wrapper_name = "libedge264",
 };
