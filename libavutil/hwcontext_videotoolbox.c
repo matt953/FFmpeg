@@ -218,6 +218,14 @@ static int vt_pool_alloc(AVHWFramesContext *ctx)
     CFRelease(w);
     CFRelease(h);
 
+    // Enable Metal compatibility so CVPixelBuffers from this pool can be
+    // rendered by AVSampleBufferDisplayLayer (which uses Metal internally)
+    // without a CPU-side copy.  Without this key the display layer falls
+    // back to software blitting, causing tearing and A/V desync.
+    CFDictionarySetValue(attributes,
+                         kCVPixelBufferMetalCompatibilityKey,
+                         kCFBooleanTrue);
+
     err = CVPixelBufferPoolCreate(
         NULL,
         NULL,

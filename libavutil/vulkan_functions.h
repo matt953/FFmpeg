@@ -51,6 +51,8 @@ typedef uint64_t FFVulkanExtensions;
 #define FF_VK_EXT_SUBGROUP_ROTATE        (1ULL << 17) /* VK_KHR_shader_subgroup_rotate */
 #define FF_VK_EXT_HOST_IMAGE_COPY        (1ULL << 18) /* VK_EXT_host_image_copy */
 
+#define FF_VK_EXT_EXTERNAL_ANDROID_HARDWARE_BUFFER (1ULL << 19) /* VK_ANDROID_external_memory_android_hardware_buffer */
+
 /* Video extensions */
 #define FF_VK_EXT_VIDEO_QUEUE            (1ULL << 36) /* VK_KHR_video_queue */
 #define FF_VK_EXT_VIDEO_MAINTENANCE_1    (1ULL << 37) /* VK_KHR_video_maintenance1 */

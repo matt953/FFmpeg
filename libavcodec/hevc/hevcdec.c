@@ -3664,6 +3664,13 @@ static int decode_nal_unit(HEVCContext *s, unsigned nal_idx)
     case HEVC_NAL_AUD:
     case HEVC_NAL_FD_NUT:
     case HEVC_NAL_UNSPEC62:
+        /* Dolby Vision RPU — pass to hwaccel so VideoToolbox's DV decoder
+         * can apply RPU processing (needed for kCMVideoCodecType_DolbyVisionHEVC). */
+        if (s->avctx->hwaccel) {
+            ret = FF_HW_CALL(s->avctx, decode_slice, nal->raw_data, nal->raw_size);
+            if (ret < 0)
+                goto fail;
+        }
         break;
     default:
         av_log(s->avctx, AV_LOG_INFO,

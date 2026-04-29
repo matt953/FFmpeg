@@ -29,6 +29,7 @@
 #include "libavutil/avutil.h"
 #include "libavutil/hwcontext.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/dovi_meta.h"
 #include "bytestream.h"
 #include "decode.h"
 #include "internal.h"
@@ -58,6 +59,14 @@ enum { kCMVideoCodecType_VP9 = 'vp09' };
 
 #if !HAVE_KCMVIDEOCODECTYPE_AV1
 enum { kCMVideoCodecType_AV1 = 'av01' };
+#endif
+
+/* Dolby Vision HEVC codec type — Apple's VideoToolbox uses this to
+ * activate native DV decoding (RPU processing, IPTPQc2 color space).
+ * Modern SDKs (iOS 18+, tvOS 18+) already define this in CMFormatDescription.h.
+ * Older SDKs need the fallback. We mirror the HAVE_ pattern used for AV1 above. */
+#if !HAVE_KCMVIDEOCODECTYPE_DOLBYVISIONHEVC
+enum { kCMVideoCodecType_DolbyVisionHEVC = 'dvh1' };
 #endif
 
 #define VIDEOTOOLBOX_ESDS_EXTRADATA_PADDING  12
@@ -733,8 +742,8 @@ static void videotoolbox_decoder_callback(void *opaque,
             vtctx->reconfig_needed = true;
 
         av_log(vtctx->logctx, status ? AV_LOG_WARNING : AV_LOG_DEBUG,
-               "vt decoder cb: output image buffer is null: %i, reconfig %d\n",
-               status, vtctx->reconfig_needed);
+               "vt decoder cb: output image buffer is null: %d (0x%08x), reconfig %d\n",
+               (int)status, (unsigned)status, vtctx->reconfig_needed);
         return;
     }
 
@@ -754,6 +763,16 @@ static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx)
 
     if (!sample_buf)
         return -1;
+
+    if (videotoolbox->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC) {
+        static int dv_frame_log_count = 0;
+        if (dv_frame_log_count < 3) {
+            dv_frame_log_count++;
+            av_log(avctx, AV_LOG_INFO,
+                   "VideoToolbox DV decode: frame #%d, bitstream_size=%d bytes\n",
+                   dv_frame_log_count, vtctx->bitstream_size);
+        }
+    }
 
     status = VTDecompressionSessionDecodeFrame(videotoolbox->session,
                                                sample_buf,
@@ -844,7 +863,8 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
                                                                    &kCFTypeDictionaryValueCallBacks);
 
     CFDictionarySetValue(config_info,
-                         codec_type == kCMVideoCodecType_HEVC ?
+                         (codec_type == kCMVideoCodecType_HEVC ||
+                          codec_type == kCMVideoCodecType_DolbyVisionHEVC) ?
                             kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                          kCFBooleanTrue);
@@ -865,6 +885,39 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
         data = ff_videotoolbox_avcc_extradata_create(avctx);
         if (data)
             CFDictionarySetValue(avc_info, CFSTR("avcC"), data);
+        break;
+    case kCMVideoCodecType_DolbyVisionHEVC :
+        /* DV HEVC: provide hvcC + dvvC atoms so Apple's decoder recognises
+         * the stream as Dolby Vision and applies RPU / IPTPQc2 processing. */
+        data = ff_videotoolbox_hvcc_extradata_create(avctx);
+        if (data)
+            CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
+        {
+            /* Serialize DOVI configuration record into 24-byte dvvC box */
+            const AVPacketSideData *dovi_sd = ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+            if (dovi_sd && dovi_sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+                const AVDOVIDecoderConfigurationRecord *dovi =
+                    (const AVDOVIDecoderConfigurationRecord *)dovi_sd->data;
+                uint8_t dvvc_buf[24] = {0};
+                dvvc_buf[0] = dovi->dv_version_major;
+                dvvc_buf[1] = dovi->dv_version_minor;
+                dvvc_buf[2] = (dovi->dv_profile << 1) | (dovi->dv_level >> 5);
+                dvvc_buf[3] = ((dovi->dv_level & 0x1f) << 3)
+                            | ((dovi->rpu_present_flag & 1) << 2)
+                            | ((dovi->el_present_flag & 1) << 1)
+                            | (dovi->bl_present_flag & 1);
+                dvvc_buf[4] = ((dovi->dv_bl_signal_compatibility_id & 0x0f) << 4)
+                            | ((dovi->dv_md_compression & 0x03) << 2);
+                CFDataRef dvvc_data = CFDataCreate(kCFAllocatorDefault, dvvc_buf, 24);
+                if (dvvc_data) {
+                    CFDictionarySetValue(avc_info, CFSTR("dvvC"), dvvc_data);
+                    CFRelease(dvvc_data);
+                }
+                av_log(avctx, AV_LOG_INFO,
+                       "VideoToolbox DV: attached dvvC (profile %d, level %d)\n",
+                       dovi->dv_profile, dovi->dv_level);
+            }
+        }
         break;
     case kCMVideoCodecType_HEVC :
         data = ff_videotoolbox_hvcc_extradata_create(avctx);
@@ -921,7 +974,39 @@ static int videotoolbox_start(AVCodecContext *avctx)
         videotoolbox->cm_codec_type = kCMVideoCodecType_H264;
         break;
     case AV_CODEC_ID_HEVC :
-        videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
+        /* Check for Dolby Vision configuration record — if it's Profile 5, use
+         * kCMVideoCodecType_DolbyVisionHEVC so Apple's VideoToolbox creates a
+         * DV-aware decoder that applies RPU processing and handles the
+         * IPTPQc2 color space natively.
+         *
+         * Apple VideoToolbox only natively supports Profile 5 (single-layer
+         * IPTPQc2). Profiles 7/8 are dual-layer (BL + EL + RPU) — the BL is
+         * HEVC Main10 HDR10-compatible and decodes fine as regular HEVC. If
+         * we enable the DV codec type for P7/P8 here, VT rejects setup
+         * ("Failed setup for format videotoolbox_vld"), and even where it
+         * doesn't reject outright the output is wrong (the decoder ignores
+         * the EL so the BL's cross-layer reshape is broken, producing the
+         * classic "all green" frames). Gate strictly on Profile 5. */
+        {
+            const AVPacketSideData *dovi_sd = ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+            if (dovi_sd && dovi_sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+                const AVDOVIDecoderConfigurationRecord *dovi =
+                    (const AVDOVIDecoderConfigurationRecord *)dovi_sd->data;
+                if (dovi->dv_profile == 5) {
+                    videotoolbox->cm_codec_type = kCMVideoCodecType_DolbyVisionHEVC;
+                    av_log(avctx, AV_LOG_INFO,
+                           "VideoToolbox: using DolbyVisionHEVC codec type (dvh1) for DV profile %d\n",
+                           dovi->dv_profile);
+                } else {
+                    videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
+                    av_log(avctx, AV_LOG_INFO,
+                           "VideoToolbox: DV profile %d not natively supported, using plain HEVC (BL is HDR10-compatible)\n",
+                           dovi->dv_profile);
+                }
+            } else {
+                videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
+            }
+        }
         break;
     case AV_CODEC_ID_MPEG1VIDEO :
         videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;

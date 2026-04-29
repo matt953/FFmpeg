@@ -660,6 +660,9 @@ static const VulkanOptExtension optional_device_exts[] = {
     { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,            FF_VK_EXT_EXTERNAL_WIN32_MEMORY  },
     { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,         FF_VK_EXT_EXTERNAL_WIN32_SEM     },
 #endif
+#ifdef __ANDROID__
+    { VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, FF_VK_EXT_EXTERNAL_ANDROID_HARDWARE_BUFFER },
+#endif
 
     /* Video encoding/decoding */
     { VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,                      FF_VK_EXT_VIDEO_QUEUE            },
@@ -2767,6 +2770,12 @@ static AVBufferRef *vulkan_pool_alloc(void *opaque, size_t size)
         hwctx->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
         try_export_flags(hwfc, &eiinfo.handleTypes, &e,
                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+#endif
+
+#ifdef __ANDROID__
+    if (p->vkctx.extensions & FF_VK_EXT_EXTERNAL_ANDROID_HARDWARE_BUFFER)
+        try_export_flags(hwfc, &eiinfo.handleTypes, &e,
+                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
 #endif
 
     for (int i = 0; i < av_pix_fmt_count_planes(hwfc->sw_format); i++) {
