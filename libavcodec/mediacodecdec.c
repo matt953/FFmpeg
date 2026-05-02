@@ -59,6 +59,7 @@ typedef struct MediaCodecH264DecContext {
     int use_ndk_codec;
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
+    char *codec_name;
 } MediaCodecH264DecContext;
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
@@ -425,6 +426,30 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
             goto done;
         break;
 #endif
+#if CONFIG_AC3_MEDIACODEC_DECODER
+    case AV_CODEC_ID_AC3:
+        codec_mime = "audio/ac3";
+
+        ret = common_set_extradata(avctx, format);
+        if (ret < 0)
+            goto done;
+        break;
+#endif
+#if CONFIG_EAC3_JOC_MEDIACODEC_DECODER || CONFIG_EAC3_MEDIACODEC_DECODER
+    case AV_CODEC_ID_EAC3:
+        // Two decoders share AV_CODEC_ID_EAC3 — distinguish by codec name.
+        // eac3_joc_mediacodec → "audio/eac3-joc" (Dolby Atmos JOC rendering)
+        // eac3_mediacodec     → "audio/eac3"     (base EAC3 only)
+        if (avctx->codec->name && strstr(avctx->codec->name, "joc"))
+            codec_mime = "audio/eac3-joc";
+        else
+            codec_mime = "audio/eac3";
+
+        ret = common_set_extradata(avctx, format);
+        if (ret < 0)
+            goto done;
+        break;
+#endif
     default:
         av_assert0(0);
     }
@@ -437,6 +462,11 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     } else {
         ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
         ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
+        // For eac3-joc MIME, tell Dolby decoder to render JOC objects
+        // into multichannel PCM (up to 7.1.4 = 12 channels)
+        if (avctx->codec_id == AV_CODEC_ID_EAC3 && codec_mime && strcmp(codec_mime, "audio/eac3-joc") == 0) {
+            ff_AMediaFormat_setInt32(format, "max-output-channel-count", 99);
+        }
     }
     if (s->operating_rate > 0)
         ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
@@ -450,6 +480,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
     s->ctx->delay_flush = s->delay_flush;
     s->ctx->use_ndk_codec = s->use_ndk_codec;
+    if (s->codec_name)
+        s->ctx->codec_name = av_strdup(s->codec_name);
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
         s->ctx = NULL;
@@ -600,6 +632,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+    { "codec_name", "Select codec by name",
+                    OFFSET(codec_name), AV_OPT_TYPE_STRING, {0}, 0, 0, VD },
     { NULL }
 };
 
@@ -709,4 +743,16 @@ DECLARE_MEDIACODEC_ADEC(amrwb, "AMR-WB", AV_CODEC_ID_AMR_WB, NULL)
 
 #if CONFIG_MP3_MEDIACODEC_DECODER
 DECLARE_MEDIACODEC_ADEC(mp3, "MP3", AV_CODEC_ID_MP3, NULL)
+#endif
+
+#if CONFIG_AC3_MEDIACODEC_DECODER
+DECLARE_MEDIACODEC_ADEC(ac3, "AC3", AV_CODEC_ID_AC3, NULL)
+#endif
+
+#if CONFIG_EAC3_JOC_MEDIACODEC_DECODER
+DECLARE_MEDIACODEC_ADEC(eac3_joc, "EAC3-JOC", AV_CODEC_ID_EAC3, NULL)
+#endif
+
+#if CONFIG_EAC3_MEDIACODEC_DECODER
+DECLARE_MEDIACODEC_ADEC(eac3, "EAC3", AV_CODEC_ID_EAC3, NULL)
 #endif
